@@ -1,5 +1,4 @@
-import torch.optim.optimizer as optim
-import torch, time, torchvision, inspect
+import torch, time, torchvision
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
@@ -11,8 +10,12 @@ from typing import Union
 from PIL import Image
 from torchmetrics.functional import confusion_matrix
 from dataclasses import dataclass
+from torch import autocast, GradScaler
+from typing import Optional
 
 plt.switch_backend('agg')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 
 def check_path(path):
@@ -20,19 +23,17 @@ def check_path(path):
 	path.mkdir(parents=True, exist_ok=True)
 
 
-@dataclass
+#TODO: assert 예외처리로 변경할 것
 class TrainConfig():
 	def __init__(self, save_point=30, batch_size=64, workers=12, epochs=10000, patience=10, lr=0.0005, inplace=(224,224),
-				transforms:dict=None, criterion=nn.CrossEntropyLoss(reduction='sum'), optimizer:optim.Optimizer=None):
+				transforms:dict|None = None, criterion=nn.CrossEntropyLoss(), optimizer:optim.Optimizer|None = None):
 		for param, name in zip((save_point, batch_size, workers, epochs, patience),('save_point', 'batch', 'workers', 'epochs', 'patience')):
 			assert isinstance(param, int), f'{name} must be instance of int'
 		assert isinstance(lr, (float, int)), 'lr must be instance of float or int'
 		assert isinstance(inplace, (int, tuple)), 'inplace must be int or tuple'
 		assert isinstance(criterion, torch.nn.modules.loss._Loss), 'criterion must be instance of _Loss'
-		if transforms:
-			assert isinstance(transforms, dict), 'transforms must be instance of dict'
-		if optimizer:
-			assert isinstance(optimizer, torch.optim.Optimizer), 'parameter must be instance of Optimizer'
+		assert isinstance(transforms, dict) or transforms is None, 'transforms must be instance of dict'
+		assert isinstance(optimizer, torch.optim.Optimizer) or optimizer is None, 'parameter must be instance of Optimizer'
 		
 		self.save_point=save_point
 		self.batch_size=batch_size
@@ -61,10 +62,10 @@ class TrainConfig():
 		assert isinstance(optimizer, torch.optim.Optimizer), 'parameter must be instance of Optimizer'
 		self.optimizer=optimizer
 
-	def nomalize(self, img:torch.Tensor):
+	def normalize(self, img:torch.Tensor):
 		return img.float()/255.0
 	
-	def save_log(self, file = None):
+	def save_log(self, file:Path):
 		file = Path(file)
 		check_path(file.parent)
 
@@ -104,7 +105,7 @@ class ImageDir(data.Dataset):
 				self.img_paths.append(file.name)
 				self.labels.append(label)
 			self.classes.append(subdir.name)
-			label+=1
+			label += 1
 
 	def __len__(self):
 		return len(self.labels)
@@ -151,28 +152,31 @@ def no_overwrite(path, mode='dir')->Path: #기존 훈련 파일이 덮어써지�
 			while path.exists(): #해당 파일이 존재 시 파일명에 숫자를 붙임
 				base=f'{file_name}_{i}{ext}'  
 				path=dir_path/base
-				i+=1
+				i += 1
 			return path #유니크 경로 반환
 
 		case 'dir': #디렉토리 레벨의 덮어쓰기 방지
 			i=1
 			path=path/f'{i}' #새로운 디렉토리 경로 생성
 			while path.exists(): #만약 해당 디렉토리가 존재하면
-				i+=1
+				i += 1
 				path=path.with_name(f'{i}') #없는 디렉토리가 나올 때 까지 숫자를 증가시키며 적용
 			return path
+		case _:
+			raise FileNotFoundError()
 
 
-def run_epoch(model:nn.Module, loader:DataLoader, criterion:_WeightedLoss, optimizer:optim.Optimizer, device:torch.device, mode:str): #에폭 하나를 실행
+def run_epoch(model:nn.Module, loader:DataLoader, criterion:_WeightedLoss, optimizer:optim.Optimizer, device:torch.device, mode:str, scaler:Optional[GradScaler] = None): #에폭 하나를 실행
 	epoch_loss,epoch_acc=.0,.0  #loss, accuracy 초기화
 
 	match mode:
 		case 'train':  #훈련 모드시 모델을 훈련 모드로, gradient를 계산
 			model.train()
 			grad_mode=torch.enable_grad()
+			assert scaler, 'train시 scaler는 반드시 존재해야 합니다'
 		case 'valid':  #validation모드에선 모델을 추론 모드로, gradient 계산 안함
 			model.eval()
-			grad_mode=torch.no_grad()
+			grad_mode=torch.inference_mode()
 		case 'test':  #테스트모드에선 inference모드로
 			model.eval()
 			grad_mode=torch.inference_mode()  #no_grad보다 훨씬 강력한 모드
@@ -186,28 +190,30 @@ def run_epoch(model:nn.Module, loader:DataLoader, criterion:_WeightedLoss, optim
 		optimizer.zero_grad()  #옵티마이저의 그래디언트 초기화
 
 		with grad_mode:  #각 모드 하에서 실행
-			outputs=model(imgs)  #추론하고
-			if type(outputs) != torch.Tensor:
-				outputs = outputs.logits
-			
-			_,preds=torch.max(outputs,1)  #top 1예측값을 가져옴
-			loss=criterion(outputs,labels)  #loss 계산
-			
-			if mode=='train':  #훈련 모드에선 역전파 포함
-				loss.backward()
-				optimizer.step()
+			with autocast(device.type, torch.bfloat16, True, True):
+				outputs=model(imgs)  #추론하고
+				if type(outputs) != torch.Tensor:
+					outputs = outputs.logits
+				
+				_,preds=torch.max(outputs,1)  #top 1예측값을 가져옴
+				loss=criterion(outputs,labels)  #loss 계산
+				
+				if mode=='train':  #훈련 모드에선 역전파 포함
+					scaler.scale(loss).backward()
+					scaler.step(optimizer)
+					scaler.update()
+
 		batch_size=len(imgs)
-		dataset_size+=batch_size
+		dataset_size += batch_size
 
 		tp,tn,fp,fn=get_confusion(outputs, labels)
-		epoch_tp+=tp
-		epoch_tn+=tn
-		epoch_fp+=fp
-		epoch_fn+=fn
+		epoch_tp += tp
+		epoch_tn += tn
+		epoch_fp += fp
+		epoch_fn += fn
 
-		torch.cuda.empty_cache() #매 에폭마다 gpu메모리 정리
-		epoch_loss+=loss.item()*batch_size  #epoch loss에 batch별 loss 가산
-		epoch_acc+=torch.sum(preds==labels).item()  #accuracy도 동일
+		epoch_loss += loss.item()*batch_size  #epoch loss에 batch별 loss 가산
+		epoch_acc += torch.sum(preds==labels).item()  #accuracy도 동일
 
 	epoch_tp/=dataset_size
 	epoch_tn/=dataset_size
@@ -231,20 +237,21 @@ def train_valid_run(model:nn.Module, train_loader:DataLoader, valid_loader:DataL
 	print(device)
 
 	es_count, total_duration=0,0  #early stop 카운트와 총 수행시간을 0으로 초기화
-	minimun_loss=float('inf')  #최소 loss를 무한대로 초기화
+	minimum_loss=float('inf')  #최소 loss를 무한대로 초기화
 	best_path=save_dir/'best_weight.pt'  #best weight 경로 설정
 	last_path=save_dir/'last_weight.pt'  #last weight 경로 설정
 
 	logs=[]
 	train_losses,train_accuracies=[],[]
 	valid_losses,valid_accuracies=[],[]
+	scaler = GradScaler()
 	for epoch in range(1, hyper_param.epochs+1):
 		since=time.time()  #에폭 시작 시간
-		train_loss, train_accuracy, train_precision, tarin_recall = run_epoch(model, train_loader, hyper_param.criterion, hyper_param.optimizer, device, 'train')  #훈련 실행
-		valid_loss, valid_accuracy, valid_precision, valid_recall=run_epoch(model, valid_loader, hyper_param.criterion, hyper_param.optimizer, device, 'valid')  #검증 실행
+		train_loss, train_accuracy, train_precision, tarin_recall = run_epoch(model, train_loader, hyper_param.criterion, hyper_param.optimizer, device, 'train', scaler)  #훈련 실행
+		valid_loss, valid_accuracy, valid_precision, valid_recall = run_epoch(model, valid_loader, hyper_param.criterion, hyper_param.optimizer, device, 'valid', scaler)  #검증 실행
 
 		duration=time.time()-since  #에폭 수행시간 계산
-		total_duration+=duration  #총 수행시간에 합산
+		total_duration += duration  #총 수행시간에 합산
 
 		print(f'epochs: {epoch}/{hyper_param.epochs}, train loss: {train_loss:.4f}, val loss: {valid_loss:.4f}, train accuracy:{train_accuracy:.4f}, val accuracy: {valid_accuracy:.4f}, duration: {duration:.0f}, total duration: {total_duration:.0f}, precision: {valid_precision:.4f}, recall: {valid_recall:.4f}')
 		log=f'epochs: {epoch}/{hyper_param.epochs}, train loss: {train_loss}, val loss: {valid_loss}, train accuracy:{train_accuracy}, val accuracy: {valid_accuracy}, train precision: {train_precision}, val precision: {valid_precision}, train recall: {tarin_recall}, val recall: {valid_recall} duration: {duration}, total duration: {total_duration}'
@@ -257,15 +264,15 @@ def train_valid_run(model:nn.Module, train_loader:DataLoader, valid_loader:DataL
 		draw_graph(valid_losses,valid_accuracies, save_dir/'valid_graph.png')
 		
 	#early stop
-		if minimun_loss<valid_loss:  #검증 로스가 최소치보다 작지 않으면
-			es_count+=1  #es count를 증가시킨다
+		if minimum_loss<valid_loss:  #검증 로스가 최소치보다 작지 않으면
+			es_count += 1  #es count를 증가시킨다
 			if hyper_param.patience>0 and es_count>=hyper_param.patience:  #만약 patience가 0보다 크고, es_count가 patience보다 높다면
 				torch.save(model.state_dict(),last_path)  #최종 훈련 가중치를 저장하고 학습 종료
 				print('early stop')
 				break
 
 		else:  #현재 loss가 최소치면
-			minimun_loss=valid_loss  #minimun loss를 갱신
+			minimum_loss=valid_loss  #minimum loss를 갱신
 			es_count=0  #early stop count를 초기화
 			torch.save(model.state_dict(), best_path)  #best weight를 저장
 			best_log=log
@@ -287,6 +294,7 @@ def train_valid_run(model:nn.Module, train_loader:DataLoader, valid_loader:DataL
 def run_test(model:nn.Module, test_loader:DataLoader, hyper_param, save_dir, device = None):
 	if device is None:
 		device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+		
 	model.to(device)
 	since=time.time()*1000
 	test_loss, test_acc, precision, recall=run_epoch(model, test_loader, hyper_param.criterion, hyper_param.optimizer, device, 'test')
@@ -305,24 +313,6 @@ def train_test(model:nn.Module, train_loader:DataLoader, valid_loader:DataLoader
 	run_test(model, test_loader, hyper_param, save_dir)
 
 
-
-def draw_graph(loss, accuracy, save_path):
-    fig = plt.figure()
-    ax1 = fig.add_subplot()
-
-    ax1.set_xlabel('Epoch')
-    ax1.plot(loss,'b-')
-    ax1.set_ylabel('Loss', color='b')
-
-    ax2 = ax1.twinx()
-    ax2.plot(accuracy, 'r-', label='Accuracy')
-    ax2.set_ylabel('Accuracy', color='r')
-
-    plt.title('Model Graph')
-    plt.savefig(save_path)
-    plt.close()
-
-
 def layer_freeze(model:torch.nn.Module, freeze_until_layer_name = None, freeze_until_layer_num = None):	#until 없으면 전부 freeze
 	num = 0
 	is_name_match = (lambda name:name.startswith(freeze_until_layer_name)) if freeze_until_layer_name else (lambda _: False)
@@ -332,7 +322,30 @@ def layer_freeze(model:torch.nn.Module, freeze_until_layer_name = None, freeze_u
 		if is_name_match(name) or num_match:
 			break
 		param.requires_grad = False
-		num += 1
+		num  +=  1
+
+
+def print_named_params(model):
+    for name, param in model.named_parameters():
+        print(name, param.shape)
+
+
+def draw_graph(loss, accuracy, save_path):
+	fig = plt.figure()
+	ax1 = fig.add_subplot()
+
+	ax1.set_xlabel('Epoch')
+	ax1.plot(loss,'b-')
+	ax1.set_ylabel('Loss', color='b')
+
+	ax2 = ax1.twinx()
+	ax2.plot(accuracy, 'r-', label='Accuracy')
+	ax2.set_ylabel('Accuracy', color='r')
+
+	plt.title('Model Graph')
+	plt.tight_layout()
+	plt.savefig(save_path)
+	plt.close()
 
 
 if __name__=='__main__':

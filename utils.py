@@ -1,37 +1,96 @@
 import PIL.Image as Image
 import PIL.ImageFile as ImageFile
 from pathlib import Path
-import threading, os, piexif, shutil
+import threading, os, piexif, shutil, json
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from tqdm import tqdm
+from collections.abc import Sequence, Iterable
+from typing import Any
+from functools import wraps
+
 ImageFile.LOAD_TRUNCATED_IMAGES=True
 
 
-def parallel(func):
-    def wrapper(input_list, *args, n_workers:int = None, use_processing:bool = False, **kwargs):
-        n_cores = os.cpu_count() or 1
-        n_workers = n_workers or n_cores
-        chunks = list_equal_split(input_list, n_workers)
-        executor_class = ProcessPoolExecutor if use_processing else ThreadPoolExecutor
+class ParallelExecutor:
+    def __init__(self, aggregator = None) -> None:
+        self.aggregator = aggregator
+    
+    def __call__(self, func) -> Any:
+            @wraps(func)
+            def wrapper(iterable:Iterable, *args, n_workers:int = 0, use_processing:bool = False, **kwargs) -> Any:
+                if not isinstance(iterable, Iterable):
+                    raise TypeError('입력은 Iterable이여야 합니다.')
+                sequence = iterable if isinstance(iterable, Sequence) else list(iterable)
+
+                requested_workers = n_workers if n_workers > 0 else os.cpu_count() or 1
+                actual_workers = max(1 , min(requested_workers, len(sequence)))
+
+                chunks = equal_split(sequence, actual_workers)
+                executor_class = ProcessPoolExecutor if use_processing else ThreadPoolExecutor
+                
+                results = [[None] for _ in range(actual_workers)]
+                with executor_class(max_workers = actual_workers) as executor:
+                    futures = {executor.submit(func, chunk, *args, **kwargs) : i for i, chunk in enumerate(chunks)}
+                    try:
+                        for future in as_completed(futures):
+                            idx = futures[future]
+                            results[idx] = future.result()
+                    
+                    except Exception as e:
+                        for k in futures.keys():
+                            k.cancel()
+                        raise e
+
+                    else:
+                        if self.aggregator:
+                            aggregated_result = self.aggregator(results)
+                        else:
+                            try:
+                                aggregated_result = self.default_aggregator(results)
+                            except Exception as e:
+                                raise e
+                        return aggregated_result
+            return wrapper
+
+
+    def shallow_flatten(self, iterable:list):
+        shallow_flattened = []
+        for item in iterable:
+            if isinstance(item, Iterable) and not isinstance(item, (str, bytes)):
+                for sub_item in item:
+                    shallow_flattened.append(sub_item)
+            else:
+                shallow_flattened.append(item)
+        return shallow_flattened
+    
+
+    def default_aggregator(self, results:list[Any]) -> Any:
+        if not len(results):
+            return results
         
-        results = [None] * n_workers
-        with executor_class(n_workers) as executor:
-            futures = {executor.submit(func, chunk, *args, **kwargs):i for i, chunk in enumerate(chunks)}
+        if isinstance(results[0], Sequence):
+            aggregated_result = self.shallow_flatten(results)
+        elif isinstance(results[0], dict):
+            aggregated_result = {}
+            for e in results:
+                aggregated_result |= e
+        elif isinstance(results[0], set):
+            aggregated_result = set()
+            for e in results:
+                aggregated_result |= e
+        else:
+            raise TypeError('default_aggtegator에서는 합칠 수 없는 자료형입니다')
 
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    results[idx] = future.result()
-                except Exception as e:
-                    results[idx] = e
-        return results
-    return wrapper
+        return aggregated_result
 
 
-def list_equal_split(input_list, n_chunk):
-    list_len = len(input_list)
-    n_chunk = n_chunk if (n_chunk != 0) and (n_chunk <= list_len) else list_len
-    chunk_size, residual = divmod(list_len, n_chunk)
+def equal_split(items:Sequence, n_chunk:int) -> Sequence:
+    sequence_len = len(items)
+    
+    if not sequence_len:
+        return [items]
+
+    n_chunk = n_chunk if (n_chunk != 0) and (n_chunk <= sequence_len) else sequence_len
+    chunk_size, residual = divmod(sequence_len, n_chunk)
     
     chunks = []
     start = 0
@@ -42,11 +101,22 @@ def list_equal_split(input_list, n_chunk):
             end += 1
             residual -= 1
 
-        chunk = input_list[start:end]
+        chunk = items[start:end]
         chunks.append(chunk)
         start = end
 
     return chunks
+
+
+def shallow_flatten(iterable:Iterable):
+    shallow_flattened = []
+    for item in iterable:
+        if isinstance(item, Iterable) and not isinstance(item, (str, bytes)):
+            for sub_item in item:
+                shallow_flattened.append(sub_item)
+        else:
+            shallow_flattened.append(item)
+    return shallow_flattened
 
 
 def is_rgb(img_path:Path):
@@ -133,35 +203,35 @@ def chk_corrupt(root:Path, dirlist):
                 file.rename(new_path)
 
 
+def prune_excess_files(root):
+    file_lens = []
+    for subdir in root.iterdir():
+        file_lens.append(len(list(subdir.iterdir())))
+
+    minimum_files = min(file_lens)
+
+    for subdir in root.iterdir():
+        files = list(subdir.iterdir())
+        outlier = files[minimum_files:]
+
+        for f in outlier:
+            f.unlink()
+
+
+def organize_files_by_json(root):
+    root = Path(root)
+    with open('files.json',  encoding='utf-8') as f:
+        file_structure = json.load(f)
+
+    for subset, calss_structure in file_structure.items():
+        subset_dir = root / subset
+        subset_dir.mkdir(exist_ok = True, parents = True)
+        for class_name, files in calss_structure.items():
+            class_dir = subset_dir / class_name
+            class_dir.mkdir(exist_ok = 1, parents = 1)
+            for file in files:
+                shutil.move(root/class_name/file, class_dir/file)
+
+
 if __name__ == '__main__':
-    root = Path(r"E:\refined")
-    dataset_split(root, 0.2,0.1)
-
-
-def main(root):
-    n_cpu = os.cpu_count()
-
-    train = root/'train'
-    valid = root/'valid'
-    # test = root/'test'
-    for d in (train, valid):
-        sub_dirs = [sub for sub in d.iterdir()]
-        chunk = len(sub_dirs) // n_cpu
-
-        residual = len(sub_dirs) % chunk
-        threads = []
-        start=0
-        for i in range(n_cpu):
-            end=start+chunk
-            if residual>i:
-                end+=1
-            dir_per_thread = sub_dirs[start:end]
-            start=end
-
-            # thread = threading.Thread(target=separate_non_rgb, args=(lst, root))
-            thread = threading.Thread(target=chk_corrupt, args=(root, dir_per_thread))
-            threads.append(thread)
-            thread.start()
- 
-        for thread in threads:
-            thread.join()
+    pass

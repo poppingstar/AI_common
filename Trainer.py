@@ -1,5 +1,4 @@
-import torch.optim.optimizer as optim
-import torch, time, torchvision, inspect
+import torch, time, torchvision
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
@@ -25,17 +24,16 @@ def check_path(path):
 
 
 #TODO: assert 예외처리로 변경할 것
-@dataclass
 class TrainConfig():
 	def __init__(self, save_point=30, batch_size=64, workers=12, epochs=10000, patience=10, lr=0.0005, inplace=(224,224),
-				transforms:dict|None = None, criterion=nn.CrossEntropyLoss(reduction='sum'), optimizer:optim.Optimizer|None = None):
+				transforms:dict|None = None, criterion=nn.CrossEntropyLoss(), optimizer:optim.Optimizer|None = None):
 		for param, name in zip((save_point, batch_size, workers, epochs, patience),('save_point', 'batch', 'workers', 'epochs', 'patience')):
 			assert isinstance(param, int), f'{name} must be instance of int'
 		assert isinstance(lr, (float, int)), 'lr must be instance of float or int'
 		assert isinstance(inplace, (int, tuple)), 'inplace must be int or tuple'
 		assert isinstance(criterion, torch.nn.modules.loss._Loss), 'criterion must be instance of _Loss'
 		assert isinstance(transforms, dict) or transforms is None, 'transforms must be instance of dict'
-		assert isinstance(optimizer, torch.optim.Optimizer) or transforms is None, 'parameter must be instance of Optimizer'
+		assert isinstance(optimizer, torch.optim.Optimizer) or optimizer is None, 'parameter must be instance of Optimizer'
 		
 		self.save_point=save_point
 		self.batch_size=batch_size
@@ -107,7 +105,7 @@ class ImageDir(data.Dataset):
 				self.img_paths.append(file.name)
 				self.labels.append(label)
 			self.classes.append(subdir.name)
-			label+=1
+			label += 1
 
 	def __len__(self):
 		return len(self.labels)
@@ -154,14 +152,14 @@ def no_overwrite(path, mode='dir')->Path: #기존 훈련 파일이 덮어써지�
 			while path.exists(): #해당 파일이 존재 시 파일명에 숫자를 붙임
 				base=f'{file_name}_{i}{ext}'  
 				path=dir_path/base
-				i+=1
+				i += 1
 			return path #유니크 경로 반환
 
 		case 'dir': #디렉토리 레벨의 덮어쓰기 방지
 			i=1
 			path=path/f'{i}' #새로운 디렉토리 경로 생성
 			while path.exists(): #만약 해당 디렉토리가 존재하면
-				i+=1
+				i += 1
 				path=path.with_name(f'{i}') #없는 디렉토리가 나올 때 까지 숫자를 증가시키며 적용
 			return path
 		case _:
@@ -204,19 +202,18 @@ def run_epoch(model:nn.Module, loader:DataLoader, criterion:_WeightedLoss, optim
 					scaler.scale(loss).backward()
 					scaler.step(optimizer)
 					scaler.update()
-				
 
 		batch_size=len(imgs)
-		dataset_size+=batch_size
+		dataset_size += batch_size
 
 		tp,tn,fp,fn=get_confusion(outputs, labels)
-		epoch_tp+=tp
-		epoch_tn+=tn
-		epoch_fp+=fp
-		epoch_fn+=fn
+		epoch_tp += tp
+		epoch_tn += tn
+		epoch_fp += fp
+		epoch_fn += fn
 
-		epoch_loss+=loss.item()*batch_size  #epoch loss에 batch별 loss 가산
-		epoch_acc+=torch.sum(preds==labels).item()  #accuracy도 동일
+		epoch_loss += loss.item()*batch_size  #epoch loss에 batch별 loss 가산
+		epoch_acc += torch.sum(preds==labels).item()  #accuracy도 동일
 
 	epoch_tp/=dataset_size
 	epoch_tn/=dataset_size
@@ -254,7 +251,7 @@ def train_valid_run(model:nn.Module, train_loader:DataLoader, valid_loader:DataL
 		valid_loss, valid_accuracy, valid_precision, valid_recall = run_epoch(model, valid_loader, hyper_param.criterion, hyper_param.optimizer, device, 'valid', scaler)  #검증 실행
 
 		duration=time.time()-since  #에폭 수행시간 계산
-		total_duration+=duration  #총 수행시간에 합산
+		total_duration += duration  #총 수행시간에 합산
 
 		print(f'epochs: {epoch}/{hyper_param.epochs}, train loss: {train_loss:.4f}, val loss: {valid_loss:.4f}, train accuracy:{train_accuracy:.4f}, val accuracy: {valid_accuracy:.4f}, duration: {duration:.0f}, total duration: {total_duration:.0f}, precision: {valid_precision:.4f}, recall: {valid_recall:.4f}')
 		log=f'epochs: {epoch}/{hyper_param.epochs}, train loss: {train_loss}, val loss: {valid_loss}, train accuracy:{train_accuracy}, val accuracy: {valid_accuracy}, train precision: {train_precision}, val precision: {valid_precision}, train recall: {tarin_recall}, val recall: {valid_recall} duration: {duration}, total duration: {total_duration}'
@@ -268,7 +265,7 @@ def train_valid_run(model:nn.Module, train_loader:DataLoader, valid_loader:DataL
 		
 	#early stop
 		if minimum_loss<valid_loss:  #검증 로스가 최소치보다 작지 않으면
-			es_count+=1  #es count를 증가시킨다
+			es_count += 1  #es count를 증가시킨다
 			if hyper_param.patience>0 and es_count>=hyper_param.patience:  #만약 patience가 0보다 크고, es_count가 patience보다 높다면
 				torch.save(model.state_dict(),last_path)  #최종 훈련 가중치를 저장하고 학습 종료
 				print('early stop')
@@ -325,7 +322,7 @@ def layer_freeze(model:torch.nn.Module, freeze_until_layer_name = None, freeze_u
 		if is_name_match(name) or num_match:
 			break
 		param.requires_grad = False
-		num += 1
+		num  +=  1
 
 
 def print_named_params(model):
@@ -349,7 +346,3 @@ def draw_graph(loss, accuracy, save_path):
 	plt.tight_layout()
 	plt.savefig(save_path)
 	plt.close()
-
-
-if __name__=='__main__':
-	pass

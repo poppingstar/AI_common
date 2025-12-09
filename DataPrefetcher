@@ -1,0 +1,42 @@
+import torch
+
+class DataPrefetcher:
+    def __init__(self, loader):
+        self.loader = iter(loader)
+        self.stream = torch.cuda.Stream() # 전송 전용 고속도로 뚫기
+        self.preload()
+
+    def preload(self):
+        try:
+            self.next_input, self.next_target = next(self.loader)
+        except StopIteration:
+            self.next_input = None
+            self.next_target = None
+            return
+
+        with torch.cuda.stream(self.stream): # 전송 전용 도로 이용
+            # 여기가 핵심! 미리 GPU VRAM으로 쏴버림 (non_blocking=True)
+            self.next_input = self.next_input.cuda(non_blocking=True)
+            self.next_target = self.next_target.cuda(non_blocking=True)
+            
+            # (선택) 실수형 변환 등도 미리 GPU에서 해두면 좋음
+            self.next_input = self.next_input.float()
+
+    def next(self):
+        torch.cuda.current_stream().wait_stream(self.stream) # 전송 끝났는지 확인
+        input = self.next_input
+        target = self.next_target
+        if input is not None:
+            input.record_stream(torch.cuda.current_stream()) # 안전장치
+            if target is not None:
+                target.record_stream(torch.cuda.current_stream())
+            self.preload() # 리턴하기 전에 다다음꺼 미리 땡겨오기
+        return input, target
+
+# --- 사용법 ---
+# loader = DataLoader(..., pin_memory=True) # pin_memory 필수!
+# prefetcher = DataPrefetcher(loader)
+# input, target = prefetcher.next()
+# while input is not None:
+#     train(input, target)
+#     input, target = prefetcher.next()
